@@ -1,0 +1,14 @@
+.DS_Store
+*.aux
+*.log
+*.swp
+*.bak
+*.synctex.gz
+*~
+lsf.o*
+*.o
+*.dSYM
+a.out
+grade.txt
+*-ubyte
+exec_*

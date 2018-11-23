@@ -1,0 +1,192 @@
+//
+//  High Performance Computing for Science and Engineering (HPCSE) 2018
+//  TDLL: Tiny Deep Learning Library - solution code for exercises 6 and 7.
+//
+//  Copyright (c) 2018 CSE-Lab, ETH Zurich, Switzerland.
+//  Distributed under the terms of the MIT license.
+//
+//  Created by Guido Novati (novatig@gmail.com).
+//
+// 1) Train convolutional autoencoder on MNIST dataset.
+// 2) Write to file the principal components.
+
+#include "network/Network.h"
+#include "network/Optimizer.h"
+#include "mnist/mnist_reader.hpp"
+#include <chrono>
+
+static void prepare_input(const std::vector<int>& image, std::vector<Real>& input)
+{
+  static const Real fac = 1/(Real)255;
+  assert(image.size() == input.size());
+  for (size_t j = 0; j < input.size(); j++) input[j] = image[j]*fac;
+}
+
+static Real compute_error(const std::vector<Real>& output, std::vector<Real>& input)
+{
+  Real l2err = 0;
+  assert(output.size() == input.size());
+  for (size_t j = 0; j < input.size(); j++) {
+    l2err += std::pow(input[j] - output[j], 2);
+    // gradient of l2err/2 wrt to output[j]:
+    input[j] = output[j] - input[j];
+  }
+  return l2err / 2;
+}
+
+int main (int argc, char** argv)
+{
+  std::cout << "MNIST data directory: ./" << std::endl;
+
+  // Load MNIST data"
+  mnist::MNIST_dataset<std::vector, std::vector<int>, uint8_t> dataset =
+  mnist::read_dataset<std::vector, std::vector, int, uint8_t>("./");
+  assert(dataset.training_labels.size() == dataset.training_images.size());
+  assert(dataset.test_labels.size() == dataset.test_images.size());
+  const int n_train_samp = dataset.training_images.size();
+  const int n_test_samp = dataset.test_images.size();
+
+  // Training parameters:
+  const int nepoch = 100, batchsize = 512;
+  const Real learn_rate = 1e-5;
+
+  static constexpr int Z = 10;
+  // ID of layer whose size is Z: (to get it just run the code and see the
+  // printed layer descriptors)
+  const int compressionID = 11;
+
+  // Create Network:
+  Network net;
+  // layer 0: input
+  net.addInput<28*28*1>();
+
+  net.addConv2D<28,28, 1, 8,8,  4, 2,2, 0,0>();
+  // output of first conv has sizes (28 -8 +2*0)/2+1 = 11
+  net.addLReLu<11*11* 4>();
+
+  net.addConv2D<11,11, 4, 6,6,  8, 1,1, 0,0>();
+  // output of first conv has sizes (11 -6 +2*0)/1+1 = 6
+  net.addLReLu< 6* 6* 8>();
+
+  net.addConv2D< 6, 6, 8, 4,4, 16, 1,1, 0,0>();
+  // output of first conv has sizes ( 6 -4 +2*0)/1+1 = 3
+  net.addLReLu< 3* 3*16>();
+
+  net.addLinear<3*3*16, Z>();
+  net.addTanh<Z>(); // compression layer
+  net.addLinear<Z, 3*3*16>();
+
+  net.addLReLu< 3* 3*16>();
+  net.addDeConv2D< 3, 3,16, 4,4, 8, 1,1, 0,0>();
+  net.addLReLu< 6* 6* 8>();
+  net.addDeConv2D< 6, 6, 8, 6,6, 4, 1,1, 0,0>();
+  net.addLReLu<11*11* 4>();
+  net.addDeConv2D<11,11, 4, 8,8, 1, 2,2, 0,0>();
+
+  //Create optimizer:
+  Optimizer<Adam> opt(net, learn_rate);
+
+  const int steps_in_epoch = n_train_samp / batchsize;
+  assert(steps_in_epoch > 0);
+
+  for (int iepoch = 0; iepoch < nepoch; iepoch++)
+  {
+    std::vector<std::vector<Real>> INP(batchsize, std::vector<Real>(28*28));
+    std::vector<std::vector<Real>> OUT(batchsize, std::vector<Real>(28*28));
+
+    std::vector<int> sample_ids(n_train_samp);
+    //fill array: 0, 1, ..., n_train_samp-1
+    std::iota(sample_ids.begin(), sample_ids.end(), 0);
+
+    //shuffle dataset in order to sample random mini batches:
+    std::shuffle(sample_ids.begin(), sample_ids.end(), net.gen );
+
+    Real epoch_mse  = 0;
+    const double t0 = omp_get_wtime();
+    for (int step = 0; step < steps_in_epoch; step++)
+    {
+      // Put `batchsize` samples in the inputs vector-of-vectors. Start from
+      // the end because it's easier to remove entries from a vectors's end.
+      //const double t1 = omp_get_wtime();
+ #pragma omp parallel for schedule(static)
+      for (int i = 0; i < batchsize; i++)
+      {
+        const int sample = sample_ids[sample_ids.size() - 1 - i];
+        prepare_input(dataset.training_images[sample], INP[i]);
+      }
+
+      //const double t2 = omp_get_wtime();
+      net.forward(OUT, INP);
+
+      //const double t3 = omp_get_wtime();
+      // Compute the error = 1/2 \Sum (OUT - INP) ^ 2
+#pragma omp parallel for schedule(static) reduction(+ : epoch_mse)
+      for (int i = 0; i < batchsize; i++)
+      {
+        // For simplicity here we overwrite INP with the gradient of the error
+        // With respect to the Network's outputs = OUT - INP. OUT and INP have
+        // the same size and that's the size of the net's output
+        const Real error = compute_error(OUT[i], INP[i]); //now INP contains ERR
+        epoch_mse += error;
+      }
+
+      //const double t4 = omp_get_wtime();
+      net.bckward(INP);
+
+      //const double t5 = omp_get_wtime();
+      opt.update(batchsize);
+
+      // Erase last batchsize randomly shuffled dataset samples:
+      sample_ids.erase(sample_ids.end()-batchsize, sample_ids.end());
+      //const double t6 = omp_get_wtime();
+      //printf("pre:%f fwd:%f err:%f bck:%f opt:%f\n", t2-t1, t3-t2, t4-t3, t5-t4, t6-t5);
+    }
+    const double elapsed = omp_get_wtime() - t0;
+
+    if(iepoch % 1 == 0)
+    {
+      const int steps_in_test = n_test_samp / batchsize;
+
+      Real test_mse = 0;
+      for (int step = 0; step < steps_in_test; step++)
+      {
+
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < batchsize; i++) {
+          const int sample = i + batchsize * step;
+          prepare_input(dataset.test_images[sample], INP[i]);
+        }
+
+        net.forward(OUT, INP);
+
+#pragma omp parallel for schedule(static) reduction(+ : test_mse)
+        for (int i = 0; i < batchsize; i++)
+          test_mse += compute_error(OUT[i], INP[i]); //now input contains err
+      }
+      printf("Training set MSE:%f, Test set MSE:%f, wclock %f\n",
+        epoch_mse/steps_in_epoch/batchsize, test_mse/steps_in_test/batchsize, elapsed);
+    }
+  }
+
+  //extract features:
+  // WARNING: if you change the shape of the net in any way, this will fail.
+  // If you add layers, edit the `compressionID` variable accordingly.
+  for (int z = 0; z < 2 * Z; z++)
+  {
+    // initialize layer output of all zeros:
+    std::vector<Real> z_vec(Z, 0);
+    // turn on only one component in the compression layer
+    z_vec[z % Z] = z >= Z ? -1 : 1;
+
+    const std::vector<Real> OUT = net.forward(z_vec, compressionID);
+    std::vector<float> OUT_float(OUT.size());
+
+    std::copy(OUT.begin(), OUT.end(), OUT_float.begin());
+
+    FILE* pFile = fopen(("component_"+std::to_string(z)+".raw").c_str(),"wb");
+    fwrite(OUT_float.data(), sizeof(float), 28*28, pFile);
+    fflush(pFile);
+    fclose(pFile);
+  }
+  return 0;
+}
